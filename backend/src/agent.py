@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -9,42 +11,31 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    inference,
     tokenize,
     room_io,
 )
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+from livekit.plugins import murf, silero, openai, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# Change this prompt to change what your voice agent does.
-# See README.md for example prompts (customer support, language tutor, receptionist).
-SYSTEM_PROMPT = """You are a friendly and efficient customer support agent for a tech company. Help users with account issues, billing questions, and product troubleshooting. Be concise, empathetic, and solution-oriented. If you don't know something, say so honestly and offer to escalate. Your responses are concise and without complex formatting, emojis, or symbols."""
+# Disaster Response System Prompt (#VoiceForBharat Edition)
+SYSTEM_PROMPT = """You are Aashray, India's AI Disaster Emergency and Crisis Response Assistant for the #VoiceForBharat project.
+Your primary role is to assist citizens, first responders, and emergency victims during natural disasters such as floods, cyclones, earthquakes, heatwaves, landslides, and urban emergencies across India.
+
+Key instructions:
+1. Always speak calmly, clearly, authoritatively, and compassionately in short, actionable sentences.
+2. Provide immediate life-safety advice (e.g. move to elevated ground during floods, shut off main gas/electric switches during earthquakes, dial national emergency helpline 112 or NDRF helpline 1070).
+3. Keep responses concise, direct, and under 2-3 short sentences so speech output remains fast and natural.
+4. Do NOT use markdown symbols, formatting, emojis, bullet points, or special characters. Speak directly as if on a radio broadcast or emergency helpline.
+"""
 
 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
-
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
 
 
 server = AgentServer()
@@ -59,58 +50,46 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
+    # Use Groq (free, ultra-fast LLM) via OpenAI-compatible API
+    groq_llm = openai.LLM(
+        model="llama-3.1-8b-instant",
+        base_url="https://api.groq.com/openai/v1",
+        api_key=os.environ.get("GROQ_API_KEY", ""),
+    )
+
+    # Set up voice AI pipeline: Groq LLM + Murf Falcon TTS + Deepgram STT
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=google.LLM(
-                model="gemini-2.5-flash",
-            ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+        llm=groq_llm,
         tts=murf.TTS(
-                voice="en-US-matthew", 
-                style="Conversation",
-                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-                text_pacing=True
-            ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+            voice="en-IN-samar",  # Valid Murf Falcon Indian English Male voice
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True
+        ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
+    # Latency tracking (Advanced Task: log end-of-user-speech to first audio out)
+    user_speech_end = 0.0
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
+    @session.on("user_speech_committed")
+    def _on_user_speech(msg):
+        nonlocal user_speech_end
+        user_speech_end = time.perf_counter()
 
-    # Start the session, which initializes the voice pipeline and warms up the models
+    @session.on("agent_speech_started")
+    def _on_agent_speech(msg):
+        nonlocal user_speech_end
+        if user_speech_end > 0:
+            latency_ms = (time.perf_counter() - user_speech_end) * 1000
+            logger.info(f"⚡ [MURF FALCON LATENCY] End-of-user-speech to first-audio-out: {latency_ms:.2f} ms")
+
     await session.start(
         agent=Assistant(),
         room=ctx.room,
@@ -126,7 +105,6 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
-    # Join the room and connect to the user
     await ctx.connect()
 
 
